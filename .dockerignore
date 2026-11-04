@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!app.py
+!convert.py
+!requirements.txt
+!package.json
+!package-lock.json
+!tsconfig.json
+!index.html
+!web/
+!web/**
