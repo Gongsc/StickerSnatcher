@@ -6,6 +6,23 @@ type Sticker = {id:string; pack:string; index:number; kind:'WEBP'|'WEBM'|'TGS'; 
 type Pack = {name:string; title:string; stickers:Sticker[]};
 type Item = Pick<Sticker,'pack'|'index'> & {status:string; error?:string};
 type Job = {status:string; items:Item[]; archive?:boolean; folder?:string; can_open_folder?:boolean; error?:string};
+type HistoryEntry = Pick<Pack, 'name' | 'title'>;
+const historyKey = 'stickersnatcher.pack-history';
+const packLink = (name:string) => `https://t.me/addstickers/${name}`;
+
+function loadHistory(): HistoryEntry[] {
+  try {
+    const entries:unknown = JSON.parse(localStorage.getItem(historyKey) || '[]');
+    if (Array.isArray(entries)) {
+      return entries.filter(entry => entry && typeof entry.title === 'string'
+        && typeof entry.name === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(entry.name)).slice(0, 30);
+    }
+  } catch {
+    // The app can still import packs when browser storage is unavailable.
+  }
+  return [];
+}
+
 const key = (s:Pick<Sticker,'pack'|'index'>) => s.pack + '/' + s.index;
 const message = (e:unknown) => e instanceof Error ? e.message : '操作失败';
 async function post(path:string, body:object) {
@@ -90,10 +107,22 @@ function Preview({sticker, token, proxy}: {sticker:Sticker; token:string; proxy:
 }
 
 function App() {
+  const [cloud, setCloud] = useState<boolean>();
+  useEffect(() => {
+    fetch('/api/settings')
+      .then(response => response.ok ? response.json() : Promise.reject())
+      .then(settings => setCloud(settings.cloud === true))
+      .catch(() => {});
+  }, []);
   const [token, setToken] = useState('');
   const [proxy, setProxy] = useState('');
   const [connection, setConnection] = useState({token:'', proxy:''});
   const [links, setLinks] = useState('');
+  const [history, setHistory] = useState(loadHistory);
+  const [clearingCache, setClearingCache] = useState(false);
+  const [notice, setNotice] = useState('');
+  const tokenInput = useRef<HTMLInputElement>(null);
+  const selectionPanel = useRef<HTMLElement>(null);
   const [packs, setPacks] = useState<Pack[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [mode, setMode] = useState<'normal'|'qq'>('normal');
@@ -133,19 +162,55 @@ function App() {
     return () => {active = false; window.clearInterval(timer);};
   }, [jobId, job?.status]);
 
-  async function importLinks() {
+  function saveHistory(entries:HistoryEntry[]) {
+    try {
+      if (entries.length) localStorage.setItem(historyKey, JSON.stringify(entries));
+      else localStorage.removeItem(historyKey);
+      setHistory(entries);
+    } catch {
+      setHistory(entries);
+      setNotice('浏览器存储不可用，历史记录的变更可能无法保留。');
+      return false;
+    }
+    return true;
+  }
+
+  async function clearCache() {
+    setClearingCache(true);
+    setError('');
+    setNotice('');
+    try {
+      const response = await post('/api/cache/clear', {token:cloud ? token.trim() : null});
+      const {removed} = await response.json();
+      setNotice(removed ? `已清除 ${removed} 个缓存文件。` : '没有需要清除的缓存。');
+    } catch (e) {setError(message(e));}
+    finally {setClearingCache(false);}
+  }
+
+  async function importLinks(source = links, fromHistory = false) {
+    if (busy || importing || clearingCache) return;
+    if (!token.trim()) {
+      setError('请先填写 Bot Token。');
+      tokenInput.current?.focus();
+      return;
+    }
+    setNotice('');
     setImporting(true);
     setError('');
     try {
-      const credentials = {token:token.trim(), proxy:proxy.trim()};
-      const result = await post('/api/import', {...credentials, proxy:credentials.proxy || null, links:links.trim().split(/\s+/)});
+      const credentials = {token:token.trim(), proxy:cloud === false ? proxy.trim() : ''};
+      const result = await post('/api/import', {...credentials, proxy:credentials.proxy || null, links:source.trim().split(/\s+/)});
       const data:{packs:Pack[]; errors:string[]} = await result.json();
       if (data.packs.length) {
+        const latest = data.packs.map(({name, title}) => ({name, title}));
+        const seen = new Set(latest.map(pack => pack.name.toLowerCase()));
+        saveHistory([...latest, ...history.filter(pack => !seen.has(pack.name.toLowerCase()))].slice(0, 30));
         setConnection(credentials);
         setPacks(data.packs);
         setSelected(new Set(data.packs.flatMap(p => p.stickers.map(key))));
         setJob(undefined);
         setJobId('');
+        if (fromHistory) requestAnimationFrame(() => selectionPanel.current?.scrollIntoView({block:'start'}));
       }
       setError(data.errors.join('；'));
     } catch (e) {setError(message(e));}
@@ -165,16 +230,16 @@ function App() {
   }
 
   return <main>
-    <header><div className="brand">Sticker<span>Snatcher</span></div><span className="badge">本地工具</span></header>
+    <header><div className="brand">Sticker<span>Snatcher</span></div><span className="badge">{cloud ? '云端模式' : '本地工具'}</span></header>
     <form className="panel" onSubmit={event => {event.preventDefault(); void importLinks();}}>
       <h2><b>01</b> 导入表情包</h2>
       <details className="guide">
         <summary>使用指南 · 获取链接到导出</summary>
         <ol>
-          <li><strong>获取 Bot Token。</strong>在 Telegram 打开 <a href="https://t.me/BotFather" target="_blank" rel="noreferrer">@BotFather</a>，发送 <code>/newbot</code>，按提示创建机器人。复制返回的 Token，填入下方输入框。连接 Telegram 需要代理时，再填写代理地址。</li>
+          <li><strong>获取 Bot Token。</strong>在 Telegram 打开 <a href="https://t.me/BotFather" target="_blank" rel="noreferrer">@BotFather</a>，发送 <code>/newbot</code>，按提示创建机器人。复制返回的 Token，填入下方输入框。{cloud === false && '连接 Telegram 需要代理时，再填写代理地址。'}</li>
           <li><strong>复制表情包链接。</strong>在聊天里点开一张贴纸。若没有打开整套预览，手机上长按、电脑上右键，选择「查看表情包」。在预览里的分享按钮或 <code>⋯</code> 菜单中选「复制链接」。</li>
-          <li><strong>导入并勾选。</strong>粘贴 <code>https://t.me/addstickers/…</code> 链接，每行一个，点击「读取表情包」。默认全选，可取消勾选，动态贴纸进入可见区域时自动播放，可点击暂停。</li>
-          <li><strong>选择格式并导出。</strong>普通模式保留原尺寸。静态贴纸保存为 PNG，动态贴纸可选 GIF 或首帧 PNG。导出后可打开文件夹或下载 ZIP。</li>
+          <li><strong>导入并勾选。</strong>粘贴 <code>https://t.me/addstickers/…</code> 链接，每行一个，点击「读取表情包」。默认全选，可按表情包展开预览并调整勾选。动态贴纸进入可见区域时自动播放，可点击暂停。</li>
+          <li><strong>选择格式并导出。</strong>普通模式保留原尺寸。静态贴纸保存为 PNG，动态贴纸可选 GIF 或首帧 PNG。{cloud === false ? '导出后可打开文件夹或下载 ZIP。' : '导出后下载 ZIP。'}</li>
           <li><strong>添加到 QQ。</strong>选择「QQ 表情适配」再导出。如果下载的是 ZIP，先解压，然后在 QQ 的自定义表情面板中添加 PNG 或 GIF 文件。</li>
         </ol>
         <p className="hint">想先试一下？<button type="button" className="example" onClick={() => {
@@ -183,21 +248,49 @@ function App() {
         }}>填入示例链接</button></p>
       </details>
       <div className="fields">
-        <label>Bot Token<input type="password" required value={token} onChange={e => setToken(e.target.value)} autoComplete="off" placeholder="从 Telegram @BotFather 获取"/></label>
-        <label>代理地址（可选）<input type="text" value={proxy} onChange={e => setProxy(e.target.value)} placeholder="例如 socks5://127.0.0.1:1080"/></label>
+        <label>Bot Token<input ref={tokenInput} type="password" required value={token} onChange={e => setToken(e.target.value)} autoComplete="off" placeholder="从 Telegram @BotFather 获取"/></label>
+        {cloud === false && <label>代理地址（可选）<input type="text" value={proxy} onChange={e => setProxy(e.target.value)} placeholder="例如 socks5://127.0.0.1:1080"/></label>}
       </div>
       <label>Telegram 表情包链接<textarea required value={links} onChange={e => setLinks(e.target.value)} placeholder="https://t.me/addstickers/…（每行一个链接）" rows={3}/></label>
-      <button className="primary" disabled={busy || importing}>{importing ? '正在导入…' : '读取表情包'}</button>
+      <button className="primary" disabled={busy || importing || clearingCache}>{importing ? '正在导入…' : '读取表情包'}</button>
     </form>
-    {error && <p role="alert" className="error">{error}</p>}
     <section className="panel">
+      <div className="section-head">
+        <h2>表情包历史</h2>
+        <div className="actions">
+          <button disabled={!history.length || importing} onClick={() => {
+            setError('');
+            setNotice('');
+            if (saveHistory([])) setNotice('已清除表情包历史。');
+          }}>清除历史</button>
+          <button disabled={cloud === undefined || importing || busy || clearingCache || (cloud && !token.trim())}
+            onClick={() => void clearCache()}>{clearingCache ? '正在清除…' : '清除缓存'}</button>
+        </div>
+      </div>
+      <p className="hint">历史记录保存在当前浏览器。{cloud ? '填写 Bot Token 后可清除该机器人的素材缓存。' : '清除缓存会删除已下载的贴纸素材。'}已导出的文件会保留。</p>
+      {notice && <p role="status">{notice}</p>}
+      {history.length ? <ul className="history">{history.map(pack => <li key={pack.name.toLowerCase()}>
+        <div><strong>{pack.title}</strong><small>{packLink(pack.name)}</small></div>
+        <button disabled={importing || busy || clearingCache} onClick={() => {
+          const link = packLink(pack.name);
+          setLinks(link);
+          void importLinks(link, true);
+        }}>重新预览</button>
+      </li>)}</ul> : <p className="empty">成功导入的表情包会显示在这里。</p>}
+    </section>
+    {error && <p role="alert" className="error">{error}</p>}
+    <section ref={selectionPanel} className="panel">
       <div className="section-head"><h2><b>02</b> 选择表情</h2><span className="badge">已选 {chosen.length} / {stickers.length}</span></div>
       {!packs.length && <p className="empty">导入表情包后，在这里预览和勾选。</p>}
       {!!packs.length && <div className="actions">
         <button onClick={() => setSelected(new Set(stickers.map(key)))}>全选</button>
         <button onClick={() => setSelected(new Set())}>清空选择</button>
       </div>}
-      {packs.map(pack => <div key={pack.name}><h3>{pack.title} <small>{pack.stickers.length} 张</small></h3>
+      {packs.map(pack => <details className="pack" key={pack.name} open={packs.length === 1}>
+        <summary>
+          <strong>{pack.title}</strong>
+          <span className="badge">已选 {pack.stickers.filter(sticker => selected.has(key(sticker))).length} / {pack.stickers.length}</span>
+        </summary>
         <div className="grid">{pack.stickers.map(s => <div key={key(s)} className={selected.has(key(s)) ? 'tile selected' : 'tile'}>
           <Preview sticker={s} {...connection}/>
           <label><input type="checkbox" checked={selected.has(key(s))} onChange={e => {
@@ -205,7 +298,8 @@ function App() {
             if (e.target.checked) next.add(key(s)); else next.delete(key(s));
             setSelected(next);
           }}/><span>#{s.index} · {s.kind}</span></label>
-        </div>)}</div></div>)}
+        </div>)}</div>
+      </details>)}
     </section>
     <section className="panel">
       <h2><b>03</b> 导出设置</h2>
@@ -223,7 +317,7 @@ function App() {
         {!transparent && <label>背景色<input type="color" value={color} onChange={e => setColor(e.target.value)}/></label>}
       </div>
       {mode === 'qq' && <p className="hint">解压后在 QQ 的自定义表情面板中添加 PNG / GIF 文件。</p>}
-      <button className="primary" disabled={busy || importing || !chosen.length} onClick={() => void start(chosen)}>导出 {chosen.length} 张表情</button>
+      <button className="primary" disabled={busy || importing || clearingCache || !chosen.length} onClick={() => void start(chosen)}>导出 {chosen.length} 张表情</button>
     </section>
     {jobId && <section className="panel" aria-live="polite">
       <h2>导出进度</h2>
@@ -238,7 +332,7 @@ function App() {
       {job?.folder && <p className="hint path">{job.can_open_folder === false ? '容器导出目录' : '本地目录'} {job.folder}</p>}
       {!!failed.length && <details><summary>查看失败原因</summary><ul>{failed.map(item => <li key={key(item)}>{key(item)} · {item.error}</li>)}</ul></details>}
     </section>}
-    <footer>StickerSnatcher · 贴纸与导出文件保存在本机</footer>
+    <footer>StickerSnatcher{cloud ? ' · 导出后下载 ZIP' : ' · 贴纸与导出文件保存在本机'}</footer>
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<App/>);

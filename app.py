@@ -8,7 +8,7 @@ import sys
 import uuid
 import zipfile
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -24,7 +24,14 @@ DATA = ROOT / ".stickers"
 CACHE = DATA / "cache"
 CACHE.mkdir(parents=True, exist_ok=True)
 OUTPUT = Path(os.getenv("STICKER_OUTPUT", str(DATA / "exports"))).resolve()
-CAN_OPEN_FOLDER = os.getenv("STICKER_CONTAINER") != "1"
+CLOUD = os.getenv("STICKER_MODE", "local") == "cloud"
+PUBLIC_ORIGIN = os.getenv("STICKER_PUBLIC_ORIGIN", "").rstrip("/")
+public_url = urlsplit(PUBLIC_ORIGIN)
+if CLOUD and (public_url.scheme != "https" or not public_url.hostname
+              or public_url.username is not None or public_url.path
+              or public_url.query or public_url.fragment):
+    raise RuntimeError("云端模式需要 STICKER_PUBLIC_ORIGIN，格式为 https://你的域名")
+CAN_OPEN_FOLDER = not CLOUD and os.getenv("STICKER_CONTAINER") != "1"
 app = FastAPI()
 jobs = {}
 workers = asyncio.Semaphore(3)
@@ -32,14 +39,46 @@ thumbnail_workers = asyncio.Semaphore(3)
 
 
 @app.middleware("http")
-async def local_only(request: Request, call_next):
-    if request.url.hostname not in {"localhost", "127.0.0.1", "::1"}:
+async def check_request(request: Request, call_next):
+    local_host = request.url.hostname in {"localhost", "127.0.0.1", "::1"}
+    public_host = CLOUD and request.url.netloc.lower() == public_url.netloc.lower()
+    if not local_host and not public_host:
         return Response(status_code=403)
     if request.method == "POST" and request.headers.get("origin") not in {
-        None, f"{request.url.scheme}://{request.url.netloc}"
+        None, PUBLIC_ORIGIN if CLOUD else f"{request.url.scheme}://{request.url.netloc}"
     }:
         return Response(status_code=403)
     return await call_next(request)
+
+
+TOKEN_PATTERN = r"[0-9]+:[A-Za-z0-9_-]+"
+
+
+class CacheRequest(BaseModel):
+    token: Optional[SecretStr] = None
+
+
+def cache_directory(token):
+    if not CLOUD:
+        return CACHE
+    if not token or not re.fullmatch(TOKEN_PATTERN, token.get_secret_value()):
+        raise HTTPException(400, "请输入有效的 Bot Token 后清除缓存")
+    scope = hashlib.sha256(token.get_secret_value().encode()).hexdigest()
+    return CACHE / "cloud" / scope
+
+
+@app.post("/api/cache/clear")
+async def clear_cache(config: CacheRequest):
+    directory = cache_directory(config.token)
+    removed = 0
+    try:
+        for path in directory.glob("*"):
+            if re.fullmatch(r"[0-9a-f]{64}|[0-9a-f]{32}\.tmp", path.name) and path.is_file():
+                path.unlink(missing_ok=True)
+                removed += 1
+    except OSError:
+        raise HTTPException(500, "部分缓存无法删除，请重试") from None
+    return {"removed": removed}
 
 
 class Connection(BaseModel):
@@ -68,7 +107,14 @@ class Export(Connection):
     max_kb: int = Field(default=500, ge=32, le=5000)
 
 
+@app.get("/api/settings")
+async def settings():
+    return {"cloud": CLOUD}
+
+
 def client(config):
+    if CLOUD and config.proxy:
+        raise HTTPException(400, "云端模式仅支持由服务器连接 Telegram")
     try:
         return httpx.AsyncClient(proxy=config.proxy.get_secret_value() if config.proxy else None,
                                  timeout=25, trust_env=False)
@@ -78,7 +124,7 @@ def client(config):
 
 async def telegram(http, config, method, **params):
     token = config.token.get_secret_value()
-    if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
+    if not re.fullmatch(TOKEN_PATTERN, token):
         raise ValueError("Bot Token 格式无效")
     try:
         for attempt in range(3):
@@ -99,7 +145,8 @@ async def telegram(http, config, method, **params):
 
 async def download(http, config, file_id):
     cache_key = hashlib.sha256(file_id.encode()).hexdigest()
-    path = CACHE / cache_key
+    directory = cache_directory(config.token)
+    path = directory / cache_key
     if path.exists():
         return path.read_bytes()
     meta = await telegram(http, config, "getFile", file_id=file_id)
@@ -117,6 +164,7 @@ async def download(http, config, file_id):
                     raise ValueError("贴纸文件过大")
     except httpx.HTTPError:
         raise ValueError("贴纸下载失败") from None
+    directory.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(uuid.uuid4().hex + ".tmp")
     temporary.write_bytes(data)
     temporary.replace(path)
@@ -217,14 +265,17 @@ async def run_export(job_id, config, state):
                         item.update(status="failed", error="素材读取、转换或保存失败")
             await asyncio.gather(*(process(s, i) for s, i in zip(config.stickers, state["items"])))
         await asyncio.to_thread(pack_archive, folder, state, config.mode)
-        state.update(status="cancelled" if state["cancel"] else "done", folder=str(folder), archive=True,
-                     can_open_folder=CAN_OPEN_FOLDER)
+        state.update(status="cancelled" if state["cancel"] else "done", archive=True, can_open_folder=CAN_OPEN_FOLDER)
+        if not CLOUD:
+            state["folder"] = str(folder)
     except Exception:
         state.update(status="failed", error="无法完成导出，请检查保存位置和磁盘空间")
 
 
 @app.post("/api/jobs", status_code=202)
 async def create_job(config: Export):
+    if CLOUD and config.proxy:
+        raise HTTPException(400, "云端模式仅支持由服务器连接 Telegram")
     keys = {(item.pack.lower(), item.index) for item in config.stickers}
     if len(keys) != len(config.stickers):
         raise HTTPException(422, "导出列表包含重复表情")

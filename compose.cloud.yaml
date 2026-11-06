@@ -1,0 +1,5 @@
+services:
+  stickersnatcher:
+    environment:
+      STICKER_MODE: cloud
+      STICKER_PUBLIC_ORIGIN: "${STICKER_PUBLIC_ORIGIN:?Set STICKER_PUBLIC_ORIGIN to the public HTTPS origin}"

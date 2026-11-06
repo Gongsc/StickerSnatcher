@@ -37,6 +37,8 @@ npm run build
 
 QQ 模式提供 PNG/GIF 和导入说明。解压后在 QQ 的自定义表情面板中添加图片，具体操作及批量添加能力取决于客户端版本。本工具生成的归档格式为 ZIP。
 
+成功导入的表情包会进入当前浏览器的历史，最多保留 30 个。填入 Bot Token 后可点击「重新预览」，再选择要导出的贴纸。「清除历史」仅删除浏览器记录，「清除缓存」删除已下载的贴纸素材，保留导出文件。云端模式只清除当前 Bot Token 对应的素材缓存。
+
 Token 随当前页面会话使用，不写入磁盘。原文件缓存位于 `.stickers/cache`。导出文件和结果清单会保存在磁盘，服务重启后需重新导入链接才能创建新任务。
 
 ### 从源码构建 rlottie
@@ -48,3 +50,16 @@ git clone --depth 1 https://github.com/Samsung/rlottie.git .stickers/rlottie-src
 cmake -S .stickers/rlottie-src -B .stickers/rlottie-build -DCMAKE_BUILD_TYPE=Release -DLOTTIE_MODULE=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_FLAGS=-U__ARM_NEON__
 cmake --build .stickers/rlottie-build --config Release
 ```
+
+## 云端部署
+
+在服务器的项目目录启动云端模式，将示例域名替换为实际 HTTPS 域名：
+
+```sh
+STICKER_PUBLIC_ORIGIN=https://stickers.example.com \
+  docker compose -f compose.yaml -f compose.cloud.yaml up -d --build
+```
+
+在服务器上用 HTTPS 反向代理把该域名转发到 `127.0.0.1:8765`，保留原始 `Host` 请求头，并在代理上配置身份验证或访问限制。应用本身没有账号系统。若使用托管容器平台，可直接构建 Dockerfile，设置 `STICKER_MODE=cloud` 和 `STICKER_PUBLIC_ORIGIN`，将 HTTPS 流量转到容器的 8765 端口。
+
+云端导出只提供 ZIP 下载。服务器不向浏览器返回文件路径，用户也不能指定代理，因此服务器需要能够访问 Telegram API。Compose 将归档保存在服务器的 `./exports` 目录，请按部署需要清理旧归档。建议运行单实例，因为正在处理的任务和进度保存在服务进程内。
